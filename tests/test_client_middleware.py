@@ -793,6 +793,8 @@ async def test_client_middleware_blocks_connection_before_established(
     # Check that no connections were leaked
     assert len(connector._conns) == 0
 
+    await connector.close()
+
 
 async def test_client_middleware_blocks_connection_without_dns_lookup(
     aiohttp_server: AiohttpServer,
@@ -861,8 +863,13 @@ async def test_client_middleware_retry_reuses_connection(
     aiohttp_server: AiohttpServer,
 ) -> None:
     """Test that connections are reused when middleware performs retries."""
+    request_count = 0
 
     async def handler(request: web.Request) -> web.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            return web.Response(status=400)  # First request returns 400 with no body
         return web.Response(text="OK")
 
     class TrackingConnector(TCPConnector):
@@ -889,9 +896,8 @@ async def test_client_middleware_retry_reuses_connection(
             while True:
                 self.attempt_count += 1
                 response = await handler(request)
-                if retry_count == 0:
+                if response.status == 400 and retry_count == 0:
                     retry_count += 1
-                    response.release()  # Release the response to enable connection reuse
                     continue
                 return response
 

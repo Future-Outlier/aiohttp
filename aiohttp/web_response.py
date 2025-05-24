@@ -89,6 +89,7 @@ class StreamResponse(BaseClass, HeadersMixin, CookieMixin):
     _eof_sent: bool = False
     _must_be_empty_body: Optional[bool] = None
     _body_length = 0
+    _send_headers_immediately = True
 
     def __init__(
         self,
@@ -186,6 +187,13 @@ class StreamResponse(BaseClass, HeadersMixin, CookieMixin):
         strategy: Optional[int] = None,
     ) -> None:
         """Enables response compression encoding."""
+        # Don't enable compression if content is already encoded.
+        # This prevents double compression and provides a safe, predictable behavior
+        # without breaking existing code that may call enable_compression() on
+        # responses that already have Content-Encoding set (e.g., FileResponse
+        # serving pre-compressed files).
+        if hdrs.CONTENT_ENCODING in self._headers:
+            return
         self._compression = True
         self._compression_force = force
         self._compression_strategy = strategy
@@ -434,6 +442,10 @@ class StreamResponse(BaseClass, HeadersMixin, CookieMixin):
         status_line = f"HTTP/{version[0]}.{version[1]} {self._status} {self._reason}"
         await writer.write_headers(status_line, self._headers)
 
+        # Send headers immediately if not opted into buffering
+        if self._send_headers_immediately:
+            writer.send_headers()
+
     async def write(
         self, data: Union[bytes, bytearray, "memoryview[int]", "memoryview[bytes]"]
     ) -> None:
@@ -512,6 +524,7 @@ class StreamResponse(BaseClass, HeadersMixin, CookieMixin):
 class Response(StreamResponse):
 
     _compressed_body: Optional[bytes] = None
+    _send_headers_immediately = False
 
     def __init__(
         self,

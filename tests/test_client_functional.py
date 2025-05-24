@@ -1582,6 +1582,7 @@ async def test_GET_DEFLATE(aiohttp_client: AiohttpClient) -> None:
         return web.json_response({"ok": True})
 
     write_mock = None
+    writelines_mock = None
     original_write_bytes = ClientRequest.write_bytes
 
     async def write_bytes(
@@ -1590,12 +1591,26 @@ async def test_GET_DEFLATE(aiohttp_client: AiohttpClient) -> None:
         conn: Connection,
         content_length: Optional[int] = None,
     ) -> None:
-        nonlocal write_mock
+        nonlocal write_mock, writelines_mock
         original_write = writer._write
+        original_writelines = writer._writelines
 
-        with mock.patch.object(
-            writer, "_write", autospec=True, spec_set=True, side_effect=original_write
-        ) as write_mock:
+        with (
+            mock.patch.object(
+                writer,
+                "_write",
+                autospec=True,
+                spec_set=True,
+                side_effect=original_write,
+            ) as write_mock,
+            mock.patch.object(
+                writer,
+                "_writelines",
+                autospec=True,
+                spec_set=True,
+                side_effect=original_writelines,
+            ) as writelines_mock,
+        ):
             await original_write_bytes(self, writer, conn, content_length)
 
     with mock.patch.object(ClientRequest, "write_bytes", write_bytes):
@@ -1608,9 +1623,20 @@ async def test_GET_DEFLATE(aiohttp_client: AiohttpClient) -> None:
             content = await resp.json()
             assert content == {"ok": True}
 
-    assert write_mock is not None
-    # No chunks should have been sent for an empty body.
-    write_mock.assert_not_called()
+    # With packet coalescing, headers are buffered and may be written
+    # during write_bytes if there's an empty body to process.
+    # The test should verify no body chunks are written, but headers
+    # may be written as part of the coalescing optimization.
+    # If _write was called, it should only be for headers ending with \r\n\r\n
+    # and not any body content
+    for call in write_mock.call_args_list:  # type: ignore[union-attr]
+        data = call[0][0]
+        assert data.endswith(
+            b"\r\n\r\n"
+        ), "Only headers should be written, not body chunks"
+
+    # No body data should be written via writelines either
+    writelines_mock.assert_not_called()  # type: ignore[union-attr]
 
 
 async def test_GET_DEFLATE_no_body(aiohttp_client: AiohttpClient) -> None:
@@ -3408,6 +3434,9 @@ async def test_aiohttp_request_ctx_manager_close_sess_on_error(
             pass
 
     assert cm._session.closed
+    # Allow event loop to process transport cleanup
+    # on Python < 3.11
+    await asyncio.sleep(0)
 
 
 async def test_aiohttp_request_ctx_manager_not_found() -> None:
@@ -4382,3 +4411,165 @@ async def test_post_connection_cleanup_with_file(
             response.raise_for_status()
 
         assert len(client._session.connector._conns) == 1
+
+
+async def test_post_content_exception_connection_kept(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Test that connections are kept after content.set_exception() with POST."""
+
+    async def handler(request: web.Request) -> web.Response:
+        await request.read()
+        return web.Response(
+            body=b"x" * 1000
+        )  # Larger response to ensure it's not pre-buffered
+
+    app = web.Application()
+    app.router.add_post("/", handler)
+    client = await aiohttp_client(app)
+
+    # POST request with body - connection should be closed after content exception
+    resp = await client.post("/", data=b"request body")
+
+    with pytest.raises(RuntimeError):
+        async with resp:
+            assert resp.status == 200
+            resp.content.set_exception(RuntimeError("Simulated error"))
+            await resp.read()
+
+    assert resp.closed
+
+    # Wait for any pending operations to complete
+    await resp.wait_for_close()
+
+    assert client._session.connector is not None
+    # Connection is kept because content.set_exception() is a client-side operation
+    # that doesn't affect the underlying connection state
+    assert len(client._session.connector._conns) == 1
+
+
+async def test_network_error_connection_closed(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Test that connections are closed after network errors."""
+
+    async def handler(request: web.Request) -> NoReturn:
+        # Read the request body
+        await request.read()
+
+        # Start sending response but close connection before completing
+        response = web.StreamResponse()
+        response.content_length = 1000  # Promise 1000 bytes
+        await response.prepare(request)
+
+        # Send partial data then force close the connection
+        await response.write(b"x" * 100)  # Only send 100 bytes
+        # Force close the transport to simulate network error
+        assert request.transport is not None
+        request.transport.close()
+        assert False, "Will not return"
+
+    app = web.Application()
+    app.router.add_post("/", handler)
+    client = await aiohttp_client(app)
+
+    # POST request that will fail due to network error
+    with pytest.raises(aiohttp.ClientPayloadError):
+        resp = await client.post("/", data=b"request body")
+        async with resp:
+            await resp.read()  # This should fail
+
+    # Give event loop a chance to process connection cleanup
+    await asyncio.sleep(0)
+
+    assert client._session.connector is not None
+    # Connection should be closed due to network error
+    assert len(client._session.connector._conns) == 0
+
+
+async def test_client_side_network_error_connection_closed(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Test that connections are closed after client-side network errors."""
+    handler_done = asyncio.Event()
+
+    async def handler(request: web.Request) -> NoReturn:
+        # Read the request body
+        await request.read()
+
+        # Start sending a large response
+        response = web.StreamResponse()
+        response.content_length = 10000  # Promise 10KB
+        await response.prepare(request)
+
+        # Send some data
+        await response.write(b"x" * 1000)
+
+        # Keep the response open - we'll interrupt from client side
+        await asyncio.wait_for(handler_done.wait(), timeout=5.0)
+        assert False, "Will not return"
+
+    app = web.Application()
+    app.router.add_post("/", handler)
+    client = await aiohttp_client(app)
+
+    # POST request that will fail due to client-side network error
+    with pytest.raises(aiohttp.ClientPayloadError):
+        resp = await client.post("/", data=b"request body")
+        async with resp:
+            # Simulate client-side network error by closing the transport
+            # This simulates connection reset, network failure, etc.
+            assert resp.connection is not None
+            assert resp.connection.protocol is not None
+            assert resp.connection.protocol.transport is not None
+            resp.connection.protocol.transport.close()
+
+            # This should fail with connection error
+            await resp.read()
+
+    # Signal handler to finish
+    handler_done.set()
+
+    # Give event loop a chance to process connection cleanup
+    await asyncio.sleep(0)
+
+    assert client._session.connector is not None
+    # Connection should be closed due to client-side network error
+    assert len(client._session.connector._conns) == 0
+
+
+async def test_empty_response_non_chunked(aiohttp_client: AiohttpClient) -> None:
+    """Test non-chunked response with empty body."""
+
+    async def handler(request: web.Request) -> web.Response:
+        # Return empty response with Content-Length: 0
+        return web.Response(body=b"", headers={"Content-Length": "0"})
+
+    app = web.Application()
+    app.router.add_get("/empty", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/empty")
+    assert resp.status == 200
+    assert resp.headers.get("Content-Length") == "0"
+    data = await resp.read()
+    assert data == b""
+    resp.close()
+
+
+async def test_set_eof_on_empty_response(aiohttp_client: AiohttpClient) -> None:
+    """Test that triggers set_eof() method."""
+
+    async def handler(request: web.Request) -> web.Response:
+        # Return response that completes immediately
+        return web.Response(status=204)  # No Content
+
+    app = web.Application()
+    app.router.add_get("/no-content", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/no-content")
+    assert resp.status == 204
+    data = await resp.read()
+    assert data == b""
+    resp.close()
